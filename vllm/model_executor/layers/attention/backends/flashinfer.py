@@ -1,17 +1,17 @@
 """Attention layer with Flash and PagedAttention."""
 from typing import List, Optional
 
+# NOTE(woosuk): This imports flash_attn under vllm/thirdparty_files/.
 from flash_attn import flash_attn_func
 import torch
+from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
 from vllm.model_executor.input_metadata import InputMetadata
-from vllm.model_executor.layers.attention.ops.paged_attn import (
-    PagedAttentionImpl)
+from vllm.model_executor.layers.attention.ops.flash_attn import (
+    FlashAttentionImpl)
 from vllm.block import KVCache
 
-
-class FlashAttentionBackend:
-
+class FlashInferBackend:
     def __init__(
         self,
         num_heads: int,
@@ -32,14 +32,17 @@ class FlashAttentionBackend:
 
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
-        suppored_head_sizes = PagedAttentionImpl.get_supported_head_sizes()
+        suppored_head_sizes = [32, 64, 128, 256]
         if head_size not in suppored_head_sizes:
             raise ValueError(
                 f"Head size {head_size} is not supported by PagedAttention. "
                 f"Supported head sizes are: {suppored_head_sizes}.")
 
-        self.sliding_window = ((self.sliding_window, self.sliding_window) if
-                               self.sliding_window is not None else (-1, -1))
+        self.sliding_window = (-1, -1)
+        if sliding_window is not None:        
+            raise RuntimeError("FlashInfer does not support sliding window attention")
+        if alibi_slopes is not None:
+            raise RuntimeError("FlashInfer does not support alibi slopes")
 
     def forward(
         self,
@@ -69,21 +72,22 @@ class FlashAttentionBackend:
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
 
-        assert kv_cache is None or isinstance(kv_cache, tuple), "unsupported KV cache layout"
-        key_cache = None if kv_cache is None else kv_cache[0]
-        value_cache = None if kv_cache is None else kv_cache[1]
+        decoder_wrapper: BatchDecodeWithPagedKVCacheWrapper = input_metadata.decoder_wrapper
+        assert decoder_wrapper is not None, "attempt to call FlashInferBackend.forward without initializing decoder_wrapper"
+
+        assert kv_cache is None or isinstance(kv_cache, torch.Tensor), "unsupported KV cache layout"
 
         # Reshape the keys and values and store them in the cache.
         # If key_cache and value_cache are not provided, the new key and value
         # vectors will not be cached. This happens during the initial memory
         # profiling run.
-        if key_cache is not None and value_cache is not None:
-            PagedAttentionImpl.reshape_and_cache(key, value, key_cache,
-                                                 value_cache, input_metadata)
+        if kv_cache is not None:
+            FlashAttentionImpl.reshape_and_cache(key, value, kv_cache[:, 0],
+                                                 kv_cache[:, 1], input_metadata)
 
         if input_metadata.is_prompt:
             # Prompt run.
-            if (key_cache is None or value_cache is None
+            if (kv_cache is None
                     or input_metadata.block_tables.numel() == 0):
                 # normal attention
                 query = query.unflatten(0, (batch_size, seq_len))
@@ -100,26 +104,10 @@ class FlashAttentionBackend:
                 )
             else:
                 # prefix-enabled attention
-                output = PagedAttentionImpl.forward_prefix(
-                    query,
-                    key,
-                    value,
-                    key_cache,
-                    value_cache,
-                    input_metadata,
-                    self.alibi_slopes,
-                )
+                raise NotImplementedError
         else:
             # Decoding run.
-            output = PagedAttentionImpl.forward_decode(
-                query,
-                key_cache,
-                value_cache,
-                input_metadata,
-                self.num_kv_heads,
-                self.scale,
-                self.alibi_slopes,
-            )
+            output = decoder_wrapper.forward(query.contiguous(), kv_cache)
 
         # Reshape the output tensor.
         return output.view(batch_size, seq_len, hidden_size)
