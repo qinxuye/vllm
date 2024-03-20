@@ -209,6 +209,42 @@ __global__ void reshape_and_cache_kernel(
   }
 }
 
+template<typename scalar_t>
+__global__ void reshape_and_cache_flash_kernel(
+  const scalar_t* __restrict__ key,           // [num_tokens, num_heads, head_size]
+  const scalar_t* __restrict__ value,         // [num_tokens, num_heads, head_size]
+  scalar_t* __restrict__ k_cache,            // [num_blocks, block_size, num_heads, head_size]
+  scalar_t* __restrict__ v_cache,            // [num_blocks, block_size, num_heads, head_size]
+  const int64_t* __restrict__ slot_mapping,   // [num_tokens]
+  const int block_stride,
+  const int key_stride,
+  const int value_stride,
+  const int num_heads,
+  const int head_size,
+  const int block_size) {
+  const int64_t token_idx = blockIdx.x;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  // NOTE: slot_idx can be -1 if the token is padded
+  if (slot_idx < 0) {
+    return;
+  }
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  const int n = num_heads * head_size;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const int64_t src_key_idx = token_idx * key_stride + i;
+    const int64_t src_value_idx = token_idx * value_stride + i;
+    const int head_idx = i / head_size;
+    const int head_offset = i % head_size;
+    const int64_t tgt_value_idx = block_idx * block_stride
+                              + block_offset * num_heads * head_size
+                              + head_idx * head_size
+                              + head_offset;
+    k_cache[tgt_value_idx] = __ldg(&key[src_key_idx]);
+    v_cache[tgt_value_idx] = __ldg(&value[src_value_idx]);
+  }
+}
+
 } // namespace vllm
 
 #define CALL_RESHAPE_AND_CACHE(KV_T, CACHE_T, IS_FP8_E5M2_KV_CACHE)                                \
